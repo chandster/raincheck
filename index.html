@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<title>Plan a picnic (raincheck)</title>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@2.0.0-beta.4/dist/leaflet.css">
+	<script type="importmap">
+		{"imports": {"leaflet": "https://cdn.jsdelivr.net/npm/leaflet@2.0.0-beta.4/dist/leaflet.js"}}
+	</script>
+	<style>
+		.leaflet-tooltip {
+			white-space: pre-line;
+		}
+		button[aria-pressed="true"] {
+			background: #1d4ed8;
+			color: #fff;
+		}
+	</style>
+</head>
+<body>
+	<button id="nasa-power-toggle" type="button" aria-pressed="true">NASA POWER data</button>
+	<button id="meteomatics-toggle" type="button" aria-pressed="false">Meteomatics observation/forecast</button>
+	<label for="month">Select month:</label>
+	<select name="month" id="month"></select>
+	<label for="year">Select year:</label>
+	<select name="year" id="year"></select>
+	<div id="map" style="width: 50%; height: 800px"></div>
+	<p id="output">Placeholder</p>
+	<script type="module">
+		import { loadLocations } from './locations.mjs';
+		import { LeafletMap, TileLayer, GeoJSON } from 'leaflet';
+		import intersect from 'https://cdn.jsdelivr.net/npm/@turf/intersect@7.2.0/+esm';
+
+		const monthNames = [
+			'January', 'February', 'March', 'April', 'May', 'June',
+			'July', 'August', 'September', 'October', 'November', 'December'
+		];
+		const monthSelect = document.getElementById('month');
+		const yearSelect = document.getElementById('year');
+		const output = document.getElementById('output');
+		const nasaButton = document.getElementById('nasa-power-toggle');
+		const meteomaticsButton = document.getElementById('meteomatics-toggle');
+		const dataByLocation = new Map();
+		let gridLayer;
+		let nasaActive = true;
+		let nasaStatus = 'loading';
+		let meteomaticsActive = false;
+		let meteomaticsStatus = 'inactive';
+		let meteomaticsData;
+		let powerRequestId = 0;
+		let meteomaticsRequestId = 0;
+
+		monthNames.forEach((name, index) => {
+			monthSelect.add(new Option(name, String(index + 1)));
+		});
+		for (let year = 1984; year <= 2025; year += 1) {
+			yearSelect.add(new Option(String(year), String(year)));
+		}
+		monthSelect.value = String(new Date().getMonth() + 1);
+		yearSelect.value = '2025';
+
+		const map = new LeafletMap('map').setView([54.405, -4.991], 6);
+		new TileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+			maxZoom: 19,
+			referrerPolicy: 'strict-origin-when-cross-origin',
+			attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+		}).addTo(map);
+
+		const locationKey = (latitude, longitude) => `${latitude},${longitude}`;
+		const formatData = feature => {
+			const { latitude, longitude } = feature.properties;
+			const lines = [`Grid cell: ${latitude}, ${longitude}`];
+			if (nasaActive) {
+				const value = dataByLocation.get(locationKey(latitude, longitude));
+				const reading = nasaStatus === 'loading'
+					? 'Loading...'
+					: nasaStatus === 'unavailable'
+						? 'Unavailable'
+						: value === undefined || value === null
+							? 'No data'
+							: `${value.toFixed(2)} mm`;
+				lines.push(`NASA POWER precipitation (PRECTOTCORR_SUM): ${reading}`);
+				lines.push(`${monthNames[Number(monthSelect.value) - 1]} ${yearSelect.value}`);
+			}
+			if (meteomaticsActive) {
+				if (meteomaticsStatus === 'loading') {
+					lines.push('Meteomatics monthly rainfall: Loading...');
+				} else if (meteomaticsStatus === 'available') {
+					const { year, month, locations } = meteomaticsData;
+					const reading = locations[0];
+					lines.push(
+						`Meteomatics monthly rainfall: ${reading.rainfall_mm.toFixed(2)} mm ` +
+						`(${monthNames[month - 1]} ${year}, ${reading.latitude}, ${reading.longitude})`
+					);
+				} else {
+					lines.push('Meteomatics monthly rainfall: Unavailable');
+				}
+			}
+			if (!nasaActive && !meteomaticsActive) {
+				lines.push('No data source is active.');
+			}
+			return lines.join('\n');
+		};
+		const updateLayerContent = () => {
+			if (!gridLayer) {
+				return;
+			}
+			gridLayer.eachLayer(layer => {
+				const text = formatData(layer.feature);
+				layer.setTooltipContent(text);
+				layer.setPopupContent(text);
+			});
+		};
+		const updateButtonState = (button, active) => {
+			button.setAttribute('aria-pressed', String(active));
+		};
+
+		try {
+			const [locations, landResponse] = await Promise.all([
+				loadLocations('http://localhost:8000/locations', output),
+				fetch('./uk-land.geojson')
+			]);
+			if (!landResponse.ok) {
+				throw new Error(`Land boundary request failed with status ${landResponse.status}`);
+			}
+
+			const land = await landResponse.json();
+			const cells = [];
+			locations.forEach(([latitude, longitude]) => {
+				const cell = {
+					type: 'Feature',
+					properties: {},
+					geometry: {
+						type: 'Polygon',
+						coordinates: [[
+							[longitude - 0.3125, latitude - 0.25],
+							[longitude + 0.3125, latitude - 0.25],
+							[longitude + 0.3125, latitude + 0.25],
+							[longitude - 0.3125, latitude + 0.25],
+							[longitude - 0.3125, latitude - 0.25]
+						]]
+					}
+				};
+				const clippedCell = intersect({
+					type: 'FeatureCollection',
+					features: [cell, land.features[0]]
+				});
+				if (clippedCell) {
+					clippedCell.properties = { latitude, longitude };
+					cells.push(clippedCell);
+				}
+			});
+
+			gridLayer = new GeoJSON(
+				{ type: 'FeatureCollection', features: cells },
+				{
+					style: {
+						color: '#1d4ed8',
+						weight: 1,
+						fillColor: '#60a5fa',
+						fillOpacity: 0.35
+					},
+					onEachFeature: (feature, layer) => {
+						layer.bindTooltip(() => formatData(feature), { sticky: true });
+						layer.bindPopup(() => formatData(feature));
+						layer.on({
+							pointerover: event => {
+								event.target.setStyle({ weight: 2, fillOpacity: 0.65 });
+								output.textContent = formatData(feature);
+							},
+							pointerout: event => gridLayer.resetStyle(event.target),
+							click: event => {
+								output.textContent = formatData(feature);
+								event.target.openPopup();
+							}
+						});
+					}
+				}
+			).addTo(map);
+
+			const updatePowerData = async () => {
+				const currentRequest = ++powerRequestId;
+				nasaStatus = 'loading';
+				updateLayerContent();
+				output.textContent = 'Loading NASA POWER data...';
+				try {
+					const response = await fetch(
+						`http://localhost:8000/power-data?year=${yearSelect.value}&month=${monthSelect.value}`
+					);
+					if (!response.ok) {
+						throw new Error(`NASA POWER request failed with status ${response.status}`);
+					}
+					const readings = await response.json();
+					if (currentRequest !== powerRequestId || !nasaActive) {
+						return;
+					}
+					dataByLocation.clear();
+					readings.forEach(({ latitude, longitude, value }) => {
+						dataByLocation.set(locationKey(latitude, longitude), value);
+					});
+					nasaStatus = 'available';
+					updateLayerContent();
+					output.textContent = 'Hover over or click a land grid cell to view active rainfall data.';
+				} catch (error) {
+					if (currentRequest === powerRequestId && nasaActive) {
+						console.error('Error fetching NASA POWER data:', error);
+						nasaStatus = 'unavailable';
+						updateLayerContent();
+						output.textContent = 'Failed to load NASA POWER data.';
+					}
+				}
+			};
+
+			const updateMeteomaticsData = async () => {
+				const currentRequest = ++meteomaticsRequestId;
+				const requestedYear = Number(yearSelect.value);
+				const requestedMonth = Number(monthSelect.value);
+				meteomaticsStatus = 'loading';
+				meteomaticsData = undefined;
+				updateLayerContent();
+				output.textContent = 'Loading Meteomatics monthly rainfall...';
+				try {
+					const response = await fetch(
+						`http://localhost:8000/rainfall?year=${requestedYear}&month=${requestedMonth}`,
+						{ cache: 'no-store' }
+					);
+					if (!response.ok) {
+						throw new Error(`Meteomatics request failed with status ${response.status}`);
+					}
+					const data = await response.json();
+					const reading = data.locations && data.locations[0];
+					if (
+						!reading ||
+						!Number.isFinite(reading.rainfall_mm) ||
+						!Number.isFinite(data.year) ||
+						!Number.isInteger(data.month) ||
+						data.year !== requestedYear ||
+						data.month !== requestedMonth
+					) {
+						throw new Error('Meteomatics returned data for an unexpected month');
+					}
+					if (currentRequest !== meteomaticsRequestId || !meteomaticsActive) {
+						return;
+					}
+					meteomaticsData = data;
+					meteomaticsStatus = 'available';
+					updateLayerContent();
+					output.textContent = 'Meteomatics monthly rainfall loaded.';
+				} catch (error) {
+					if (currentRequest === meteomaticsRequestId && meteomaticsActive) {
+						console.error('Error fetching Meteomatics monthly rainfall:', error);
+						meteomaticsStatus = 'unavailable';
+						updateLayerContent();
+						output.textContent = 'Meteomatics monthly rainfall is unavailable.';
+					}
+				}
+			};
+
+			nasaButton.addEventListener('click', () => {
+				nasaActive = !nasaActive;
+				updateButtonState(nasaButton, nasaActive);
+				if (nasaActive) {
+					updatePowerData();
+				} else {
+					powerRequestId += 1;
+					nasaStatus = 'inactive';
+					dataByLocation.clear();
+					updateLayerContent();
+					output.textContent = 'NASA POWER data deactivated.';
+				}
+			});
+			meteomaticsButton.addEventListener('click', () => {
+				meteomaticsActive = !meteomaticsActive;
+				updateButtonState(meteomaticsButton, meteomaticsActive);
+				if (meteomaticsActive) {
+					updateMeteomaticsData();
+				} else {
+					meteomaticsRequestId += 1;
+					meteomaticsStatus = 'inactive';
+					meteomaticsData = undefined;
+					updateLayerContent();
+					output.textContent = 'Meteomatics data deactivated.';
+				}
+			});
+			monthSelect.addEventListener('change', () => {
+				if (nasaActive) {
+					updatePowerData();
+				}
+				if (meteomaticsActive) {
+					updateMeteomaticsData();
+				}
+			});
+			yearSelect.addEventListener('change', () => {
+				if (nasaActive) {
+					updatePowerData();
+				}
+				if (meteomaticsActive) {
+					updateMeteomaticsData();
+				}
+			});
+			await updatePowerData();
+		} catch (error) {
+			console.error('Error loading map data:', error);
+			output.textContent = 'Failed to load map data.';
+		}
+	</script>
+</body>
+</html>
